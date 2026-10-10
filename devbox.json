@@ -1,0 +1,33 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.17.2/.schema/devbox.schema.json",
+  "packages": [
+    "python3@latest",
+    "platformio@latest"
+  ],
+  "shell": {
+    "init_hook": [
+      "echo 'Welcome to devbox!' > /dev/null"
+    ],
+    "scripts": {
+      "clean": [
+        "pio run -e inkplate13spectra -t clean"
+      ],
+      "build": [
+        "pio run -e inkplate13spectra"
+      ],
+      "build-upload": [
+        "pio run -e inkplate13spectra -t upload",
+        "pio device monitor -b 115200"
+      ],
+      "monitor": [
+        "pio device monitor -b 115200"
+      ],
+      "compile-commands": [
+        "pio run -e inkplate13spectra -t compiledb"
+      ],
+      "test": [
+        "echo \"Error: no test specified\" && exit 1"
+      ]
+    }
+  }
+}
