@@ -281,7 +281,11 @@ const char* imageTypeToString(ImageType type) {
         default:                return "ERROR";
     }
 }
-bool drawImageFromSD(const char *path)
+bool drawImageFromSD(
+    const char *path,
+    int8_t ditherOverride ,
+    bool quiet
+)
 {
     if (path == nullptr || path[0] == '\0')
     {
@@ -306,9 +310,12 @@ bool drawImageFromSD(const char *path)
     Serial.printf("[IMAGE][SD] Rendering %s\n", path);
     displayStatusMessage("Rendering cached image...");
 
-    const uint8_t effectiveKernel = plateCfg.ditherKernel;
-    const bool useDither = effectiveKernel != 0;
+    uint8_t effectiveKernel =
+        ditherOverride >= 0
+            ? static_cast<uint8_t>(ditherOverride)
+            : plateCfg.ditherKernel;
 
+    bool useDither = effectiveKernel != 0;
     if (useDither)
     {
         display.image.setDitherKernel(
@@ -415,7 +422,8 @@ bool drawImageFromURL(const char *url) {
 
     // The received Content-Length is ~30 MB, so the previous 16 MiB default
     // is insufficient. Keep a bounded limit, but allow this image.
-    static const size_t MAX_SD_IMAGE_SIZE = 64UL * 1024UL * 1024UL;
+    static constexpr size_t MAX_SD_IMAGE_SIZE =
+    8UL * 1024UL * 1024UL;
 
     Serial.printf(
         "[IMAGE] Downloading image to SD%s: %s\n",
@@ -493,7 +501,24 @@ bool drawImageFromURL(const char *url) {
 
     // The file is named .png so the Inkplate library selects its PNG SD
     // decoder. This endpoint must actually return PNG data.
-    bool good = drawImageFromSD(nextPath);
+    int8_t effectiveOverride = mqttOverride;
+
+    auto ditherHeader = respHeaders.find("X-Dither");
+    if (ditherHeader != respHeaders.end())
+    {
+        int8_t parsed = parseDitherName(ditherHeader->second.c_str());
+
+        if (parsed >= 0)
+        {
+            effectiveOverride = parsed;
+        }
+    }
+
+    bool good = drawImageFromSD(
+        nextPath,
+        effectiveOverride,
+        true
+    );
 
     if (!good)
     {

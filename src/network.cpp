@@ -21,8 +21,8 @@ static bool recoverSDCard()
 {
     Serial.println("[NET][SD] Resetting SD card");
 
-    spiStart();
     i2cStart();
+    spiStart();
 
     SdFat &sd = display.getSdFat();
 
@@ -34,8 +34,8 @@ static bool recoverSDCard()
     bool good = display.sdCardInit();
     display.setSdCardOk(good);
 
-    i2cEnd();
     spiEnd();
+    i2cEnd();
 
     Serial.printf(
         "[NET][SD] Reset %s\n",
@@ -662,8 +662,14 @@ bool httpGetToSDRetry(uint32_t tries, const char *url, const char *tempPath,
             *httpCodeOut = code;
         if (code == HTTP_CODE_NOT_MODIFIED)
             return false;
-        if (i + 1 < tries)
-            vTaskDelay(SECOND / portTICK_PERIOD_MS);
+
+        if (i + 1 >= tries)
+        {
+            break;
+        }
+
+        vTaskDelay(SECOND / portTICK_PERIOD_MS);
+
         if (!recoverSDCard())
         {
             Serial.println("[NET][SD] Cannot continue retries");

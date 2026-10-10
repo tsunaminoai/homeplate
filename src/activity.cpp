@@ -205,13 +205,28 @@ void runActivities(void *params)
                 Serial.printf("[ACTIVITY][ERROR] HomeAssistant Activity reset while waiting, aborting...\n");
                 continue;
             }
-            // drawImageFromURL(plateCfg.imageUrl);
-            if (WiFi.isConnected()) {
-            if (!drawImageFromURL(plateCfg.imageUrl))
-                drawImageFromSD("/last.png");
-            } else {
-                if (!drawImageFromSD("/last.png"))
-                    drawImageFromSD("/offline.png");
+           bool rendered = false;
+
+            if (WiFi.isConnected())
+            {
+                rendered = drawImageFromURL(plateCfg.imageUrl);
+            }
+
+            if (!rendered)
+            {
+                rendered = drawImageFromSD("/last.png", plateCfg.ditherKernel, true);
+            }
+
+            if (!rendered)
+            {
+                rendered = drawImageFromSD("/offline.png", plateCfg.ditherKernel, true);
+            }
+
+            if (!rendered)
+            {
+                Serial.println(
+                    "[ACTIVITY] No downloaded, cached, or offline image available"
+                );
             }
             break;
         }

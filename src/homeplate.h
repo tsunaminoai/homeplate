@@ -188,8 +188,11 @@ void invalidateImageCache();
 // displayStatusMessage that run early in a wake should gate on this.
 bool imageCacheArmed();
 
-bool drawImageFromSD(const char *path);
-
+bool drawImageFromSD(
+    const char *path,
+    int8_t ditherOverride = -1,
+    bool quiet = false
+);
 // Dither
 // Parse a user-supplied dither name (HTTP header or MQTT field).
 // Returns: -1 = unset / unknown (caller falls back to plateCfg.ditherKernel),
@@ -349,7 +352,7 @@ private:
 #define BATTERY_VOLTAGE_WARNING_SLEEP 3.2	// prevents deep discharge => longer battery live
 #define BATTERY_PERCENT_WARNING 10		// =3.48V
 
-// enable SD card (currently unused)
+// Enable SD-backed image downloads and last-known-good caching.
 #define USE_SDCARD true
 
 // debounce time limit for static activities
