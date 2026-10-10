@@ -16,6 +16,35 @@ bool getWifIFailed()
     return wifiFailed;
 }
 
+
+static bool recoverSDCard()
+{
+    Serial.println("[NET][SD] Resetting SD card");
+
+    spiStart();
+    i2cStart();
+
+    SdFat &sd = display.getSdFat();
+
+    sd.end();
+    display.sdCardSleep();
+
+    vTaskDelay(250 / portTICK_PERIOD_MS);
+
+    bool good = display.sdCardInit();
+    display.setSdCardOk(good);
+
+    i2cEnd();
+    spiEnd();
+
+    Serial.printf(
+        "[NET][SD] Reset %s\n",
+        good ? "successful" : "failed"
+    );
+
+    return good;
+}
+
 void waitForWiFi()
 {
     while (!WiFi.isConnected())
@@ -304,6 +333,344 @@ uint8_t* httpGetRetry(uint32_t trys, const char* url, std::map<String, String> *
         vTaskDelay(1 * SECOND/portTICK_PERIOD_MS);
     }
     return ret;
+}
+
+
+// Stream adapter for SdFat's SdFile. SdFile derives from Print, while
+// HTTPClient::writeToStream() requires a Stream. This adapter remains write-only
+// and enforces a maximum response size even when the server uses chunked
+// transfer encoding and does not send Content-Length.
+class SdWriteStream : public Stream
+{
+  public:
+    SdWriteStream(SdFile &file, size_t maxBytes)
+        : file_(file), maxBytes_(maxBytes), bytesWritten_(0), failed_(false)
+    {
+    }
+
+    size_t write(uint8_t value) override
+    {
+        return write(&value, 1);
+    }
+
+    size_t write(const uint8_t *buffer, size_t size) override
+    {
+        if (failed_ || buffer == nullptr || size == 0)
+            return 0;
+
+        if (bytesWritten_ > maxBytes_ ||
+            size > maxBytes_ - bytesWritten_)
+        {
+            Serial.printf(
+                "[NET][SD] Response exceeds %u-byte limit\n",
+                (unsigned)maxBytes_
+            );
+            failed_ = true;
+            return 0;
+        }
+
+        size_t written = file_.write(buffer, size);
+        bytesWritten_ += written;
+
+        if (written != size)
+        {
+            Serial.printf(
+                "[NET][SD] Short write: %u of %u bytes at offset %u\n",
+                (unsigned)written,
+                (unsigned)size,
+                (unsigned)bytesWritten_
+            );
+
+            failed_ = true;
+            return written;
+        }
+
+        // The standalone SD test succeeds with paced writes. taskYIELD() may
+        // immediately return when no equal-priority task is runnable.
+        vTaskDelay(1);
+        return written;
+    }
+
+    int available() override { return 0; }
+    int read() override { return -1; }
+    int peek() override { return -1; }
+
+    void flush() override
+    {
+        // Intentionally empty. Final sync is performed by httpGetToSD().
+    }
+
+    size_t bytesWritten() const { return bytesWritten_; }
+    bool failed() const { return failed_; }
+
+  private:
+    SdFile &file_;
+    size_t maxBytes_;
+    size_t bytesWritten_;
+    bool failed_;
+};
+
+// Download an HTTP response directly to a temporary file on microSD without
+// allocating a body-sized PSRAM buffer. The caller owns cache promotion and
+// should render/validate tempPath before renaming it over the last-known-good
+// image. A false return with httpCodeOut == 304 means Not Modified, not failure.
+bool httpGetToSD(const char *url, const char *tempPath,
+                 std::map<String, String> *headers, uint32_t timeout_sec,
+                 std::map<String, String> *responseHeadersOut,
+                 int *httpCodeOut, size_t *bytesWrittenOut,
+                 size_t maxBytes)
+{
+    if (httpCodeOut)
+        *httpCodeOut = 0;
+    if (bytesWrittenOut)
+        *bytesWrittenOut = 0;
+
+    if (!USE_SDCARD)
+    {
+        Serial.println("[NET][SD] USE_SDCARD is disabled");
+        return false;
+    }
+    if (!url || strlen(url) == 0 || !tempPath || strlen(tempPath) == 0)
+    {
+        Serial.println("[NET][SD] Invalid URL or temporary path");
+        return false;
+    }
+    if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0)
+    {
+        Serial.printf("[NET][SD] Invalid URL protocol: %s\n", url);
+        return false;
+    }
+    if (maxBytes == 0)
+    {
+        Serial.println("[NET][SD] Maximum download size cannot be zero");
+        return false;
+    }
+    if (!display.getSdCardOk())
+    {
+        Serial.println("[NET][SD] SD card is not initialized");
+        return false;
+    }
+
+    Serial.printf("[NET][SD] downloading %s to %s\n", url, tempPath);
+
+    bool wifiSleep = WiFi.getSleep();
+    WiFi.setSleep(false);
+    WakeLock lock("http-get-sd", timeout_sec + 5);
+    HTTPClient http;
+    http.begin(url);
+
+    uint32_t timeout_ms = timeout_sec * 1000;
+    http.setTimeout(timeout_ms > UINT16_MAX ? UINT16_MAX : (uint16_t)timeout_ms);
+
+    if (headers)
+    {
+        for (const auto &header : *headers)
+            http.addHeader(header.first, header.second);
+    }
+
+    static const char *watchedHeaders[] = {"X-Dither", "ETag", "Last-Modified", "Content-Type"};
+    if (responseHeadersOut)
+        http.collectHeaders(watchedHeaders, sizeof(watchedHeaders) / sizeof(watchedHeaders[0]));
+
+    int httpCode = http.GET();
+    if (httpCodeOut)
+        *httpCodeOut = httpCode;
+
+    if (httpCode < 0)
+    {
+        String reason = (httpCode == HTTPC_ERROR_CONNECTION_REFUSED)
+                            ? String("could not connect (DNS/TCP/TLS; see any ssl_client or lwip errors above)")
+                            : HTTPClient::errorToString(httpCode);
+        Serial.printf("[NET][SD] GET failed: %d (%s) for URL %s\n",
+                      httpCode, reason.c_str(), url);
+        http.end();
+        WiFi.setSleep(wifiSleep);
+        return false;
+    }
+
+    if (responseHeadersOut)
+    {
+        responseHeadersOut->clear();
+        for (int i = 0; i < http.headers(); i++)
+        {
+            String value = http.header(i);
+            if (value.length() != 0)
+                (*responseHeadersOut)[http.headerName(i)] = value;
+        }
+    }
+
+    if (httpCode == HTTP_CODE_NOT_MODIFIED)
+    {
+        Serial.printf("[NET][SD] 304 Not Modified: %s\n", url);
+        http.end();
+        WiFi.setSleep(wifiSleep);
+        return false;
+    }
+
+    if (httpCode != HTTP_CODE_OK)
+    {
+        Serial.printf("[NET][SD] Non-200 response: %d from URL %s\n", httpCode, url);
+        http.end();
+        WiFi.setSleep(wifiSleep);
+        return false;
+    }
+
+    int32_t contentLength = http.getSize();
+    if (contentLength == 0 || (contentLength > 0 && (size_t)contentLength > maxBytes))
+    {
+        Serial.printf("[NET][SD] Invalid or excessive Content-Length: %d bytes\n", contentLength);
+        http.end();
+        WiFi.setSleep(wifiSleep);
+        return false;
+    }
+
+    spiStart();
+    SdFat &sd = display.getSdFat();
+    sd.remove(tempPath); // Ignore ENOENT; never append to a prior partial file.
+
+    SdFile file;
+
+    if (!file.open(tempPath, O_CREAT | O_TRUNC | O_WRONLY))
+    {
+        Serial.printf("[NET][SD] Unable to open %s for writing\n", tempPath);
+        spiEnd();
+        http.end();
+        WiFi.setSleep(wifiSleep);
+        return false;
+    }
+
+    if (contentLength > 0)
+    {
+        Serial.printf(
+            "[NET][SD] Preallocating %d bytes\n",
+            contentLength
+        );
+
+        if (!file.preAllocate((uint64_t)contentLength))
+        {
+            Serial.println("[NET][SD] Preallocation failed");
+
+            SdCard *card = sd.card();
+            Serial.printf(
+                "[NET][SD] card errorCode=0x%02X errorData=0x%02X\n",
+                card ? card->errorCode() : 0xff,
+                card ? card->errorData() : 0xff
+            );
+
+            file.close();
+            sd.remove(tempPath);
+            spiEnd();
+            http.end();
+            WiFi.setSleep(wifiSleep);
+            return false;
+        }
+
+        // preAllocate() sets the apparent file size. Rewind before streaming.
+        if (!file.seekSet(0))
+        {
+            Serial.println("[NET][SD] Failed to rewind preallocated file");
+            file.close();
+            sd.remove(tempPath);
+            spiEnd();
+            http.end();
+            WiFi.setSleep(wifiSleep);
+            return false;
+        }
+    }
+
+    SdWriteStream sink(file, maxBytes);
+    int streamed = http.writeToStream(&sink);
+    sink.flush();
+
+    bool fileError = sink.failed() || file.getWriteError();
+
+    if (fileError)
+    {
+        SdFat &sdDiag = display.getSdFat();
+
+        Serial.printf(
+            "[NET][SD] card errorCode=0x%02X errorData=0x%02X\n",
+            sdDiag.sdErrorCode(),
+            sdDiag.sdErrorData()
+        );
+    }
+    size_t total = sink.bytesWritten();
+    if (!fileError && !file.truncate(total))
+    {
+        Serial.println("[NET][SD] Failed to truncate downloaded file");
+        fileError = true;
+    }
+
+    if (!file.sync())
+    {
+        Serial.println("[NET][SD] Final sync failed");
+        fileError = true;
+    }
+
+    file.close();
+
+    bool complete = streamed >= 0 && !fileError && total > 0;
+    if (contentLength > 0 && total != (size_t)contentLength)
+    {
+        Serial.printf("[NET][SD] Incomplete response: got %u of %d bytes\n",
+                      (unsigned)total, contentLength);
+        complete = false;
+    }
+
+    if (!complete)
+    {
+        if (streamed < 0)
+            Serial.printf("[NET][SD] writeToStream error: %d\n", streamed);
+        sd.remove(tempPath);
+    }
+    spiEnd();
+
+    http.end();
+    WiFi.setSleep(wifiSleep);
+
+    if (!complete)
+        return false;
+
+    if (bytesWrittenOut)
+        *bytesWrittenOut = total;
+    Serial.printf("[NET][SD] Download complete: %u bytes -> %s\n",
+                  (unsigned)total, tempPath);
+    return true;
+}
+
+
+
+bool httpGetToSDRetry(uint32_t tries, const char *url, const char *tempPath,
+                      std::map<String, String> *headers, uint32_t timeout_sec,
+                      std::map<String, String> *responseHeadersOut,
+                      int *httpCodeOut, size_t *bytesWrittenOut,
+                      size_t maxBytes)
+{
+    for (uint32_t i = 0; i < tries; i++)
+    {
+        Serial.printf("[NET][SD] download attempt: %u\n", (unsigned)(i + 1));
+        int code = 0;
+        if (httpGetToSD(url, tempPath, headers, timeout_sec,
+                        responseHeadersOut, &code, bytesWrittenOut, maxBytes))
+        {
+            if (httpCodeOut)
+                *httpCodeOut = code;
+            return true;
+        }
+
+        if (httpCodeOut)
+            *httpCodeOut = code;
+        if (code == HTTP_CODE_NOT_MODIFIED)
+            return false;
+        if (i + 1 < tries)
+            vTaskDelay(SECOND / portTICK_PERIOD_MS);
+        if (!recoverSDCard())
+        {
+            Serial.println("[NET][SD] Cannot continue retries");
+            break;
+        }
+    }
+    return false;
 }
 
 

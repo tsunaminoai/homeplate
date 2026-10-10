@@ -188,6 +188,8 @@ void invalidateImageCache();
 // displayStatusMessage that run early in a wake should gate on this.
 bool imageCacheArmed();
 
+bool drawImageFromSD(const char *path);
+
 // Dither
 // Parse a user-supplied dither name (HTTP header or MQTT field).
 // Returns: -1 = unset / unknown (caller falls back to plateCfg.ditherKernel),
@@ -268,6 +270,8 @@ void printDebug(const char *s);
 // from a failure: both return nullptr.
 uint8_t* httpGet(const char* url, std::map<String, String> *headers, int32_t* defaultLen, uint32_t timeout_sec = 5, std::map<String, String> *responseHeadersOut = nullptr, int *httpCodeOut = nullptr);
 uint8_t* httpGetRetry(uint32_t trys, const char* url, std::map<String, String> *headers, int32_t* defaultLen, uint32_t timeout_sec, std::map<String, String> *responseHeadersOut = nullptr, int *httpCodeOut = nullptr);
+bool httpGetToSD(const char *url, const char *tempPath, std::map<String, String> *headers, uint32_t timeout_sec = 5, std::map<String, String> *responseHeadersOut = nullptr, int *httpCodeOut = nullptr, size_t *bytesWrittenOut = nullptr, size_t maxBytes = 16 * 1024 * 1024);
+bool httpGetToSDRetry(uint32_t tries, const char *url, const char *tempPath, std::map<String, String> *headers, uint32_t timeout_sec, std::map<String, String> *responseHeadersOut = nullptr, int *httpCodeOut = nullptr, size_t *bytesWrittenOut = nullptr, size_t maxBytes = 16 * 1024 * 1024);
 int httpPost(const char* url, std::map<String, String> *headers, const char* body);
 
 // message
@@ -346,7 +350,7 @@ private:
 #define BATTERY_PERCENT_WARNING 10		// =3.48V
 
 // enable SD card (currently unused)
-#define USE_SDCARD false
+#define USE_SDCARD true
 
 // debounce time limit for static activities
 #define MIN_ACTIVITY_RESTART_SECS 5

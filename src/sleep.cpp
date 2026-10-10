@@ -79,6 +79,14 @@ void gotoSleepNow()
 
     Serial.printf("[SLEEP] entering sleep for %u seconds (%u min)\n\n\n", safeSleepDuration, safeSleepDuration / 60);
     vTaskDelay(50 / portTICK_PERIOD_MS);
+    if (USE_SDCARD) {
+        i2cStart();
+        spiStart();
+        display.sdCardSleep();
+        spiEnd();
+        i2cEnd();
+    }
+
     esp_deep_sleep_start(); // Put ESP32 into deep sleep. Program stops here.
 }
 

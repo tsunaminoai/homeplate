@@ -281,6 +281,101 @@ const char* imageTypeToString(ImageType type) {
         default:                return "ERROR";
     }
 }
+bool drawImageFromSD(const char *path)
+{
+    if (path == nullptr || path[0] == '\0')
+    {
+        Serial.println("[IMAGE][SD] Invalid path");
+        return false;
+    }
+
+    if (!USE_SDCARD)
+    {
+        Serial.println("[IMAGE][SD] SD support is disabled");
+        return false;
+    }
+
+    if (!display.getSdCardOk())
+    {
+        Serial.println("[IMAGE][SD] SD card is not initialized");
+        return false;
+    }
+
+    WakeLock lock("image-render-sd", 90);
+
+    Serial.printf("[IMAGE][SD] Rendering %s\n", path);
+    displayStatusMessage("Rendering cached image...");
+
+    const uint8_t effectiveKernel = plateCfg.ditherKernel;
+    const bool useDither = effectiveKernel != 0;
+
+    if (useDither)
+    {
+        display.image.setDitherKernel(
+            (decltype(display.image)::DitherKernel)(effectiveKernel - 1)
+        );
+    }
+
+    displayStart();
+
+#ifdef INKPLATE_HAS_DISPLAY_MODES
+    display.selectDisplayMode(DISPLAY_MODE);
+#endif
+
+    display.clearDisplay();
+
+    // The Inkplate library chooses PNG/JPEG/BMP decoding from the extension.
+    bool good = display.image.draw(
+        path,
+        0,
+        0,
+        useDither,
+        false
+    );
+
+    displayEnd();
+
+    if (!good)
+    {
+        Serial.printf("[IMAGE][SD] Failed to decode %s\n", path);
+
+        if (!stopActivity())
+        {
+            displayCriticalMessage("SD Image Error");
+        }
+
+        return false;
+    }
+
+    if (stopActivity())
+    {
+        Serial.println("[IMAGE][SD] Activity changed; abandoning refresh");
+
+        displayStart();
+        display.clearDisplay();
+        displayEnd();
+
+        return false;
+    }
+
+    if (plateCfg.displayLastUpdateTime)
+    {
+        displayStats();
+    }
+
+    Serial.println("[IMAGE][SD] Refreshing display");
+
+    i2cStart();
+    displayStart();
+    displayRefresh();
+    vTaskDelay(250 / portTICK_PERIOD_MS);
+    displayEnd();
+    i2cEnd();
+
+    Serial.println("[IMAGE][SD] Display complete");
+    return true;
+}
+
 
 bool drawImageFromURL(const char *url) {
  if (url == NULL) {
@@ -315,77 +410,163 @@ bool drawImageFromURL(const char *url) {
 
     // Intentionally the compile-time E_INK_* constants: this is a buffer size,
     // and width*height is the same in either orientation.
-    static int32_t len = E_INK_WIDTH * E_INK_HEIGHT + 100;
-    Serial.printf("[IMAGE] Downloading image%s: %s\n", conditional ? " (conditional)" : "", url);
+    static const char *nextPath = "/next.png";
+    static const char *lastPath = "/last.png";
+
+    // The received Content-Length is ~30 MB, so the previous 16 MiB default
+    // is insufficient. Keep a bounded limit, but allow this image.
+    static const size_t MAX_SD_IMAGE_SIZE = 64UL * 1024UL * 1024UL;
+
+    Serial.printf(
+        "[IMAGE] Downloading image to SD%s: %s\n",
+        conditional ? " (conditional)" : "",
+        url
+    );
+
     std::map<String, String> respHeaders;
     int httpCode = 0;
-    uint8_t *buff = httpGetRetry(3, url, conditional ? &reqHeaders : NULL, &len,
-                                 IMAGE_HTTP_REQUEST_TIMEOUT, &respHeaders, &httpCode);
+    size_t downloadedBytes = 0;
 
-    if (!buff && httpCode == HTTP_CODE_NOT_MODIFIED)
+    bool downloaded = httpGetToSDRetry(
+        3,
+        url,
+        nextPath,
+        conditional ? &reqHeaders : nullptr,
+        IMAGE_HTTP_REQUEST_TIMEOUT,
+        &respHeaders,
+        &httpCode,
+        &downloadedBytes,
+        MAX_SD_IMAGE_SIZE
+    );
+
+    if (!downloaded && httpCode == HTTP_CODE_NOT_MODIFIED)
     {
-        // Re-check rather than trusting the pre-request test: another activity
-        // could have repainted the panel while the request was in flight, which
-        // would make "unchanged" true of the server and false of the glass.
         if (imageCacheUsable(url))
         {
             Serial.println("[IMAGE] unchanged (304), skipping render");
             return true;
         }
-        // Either the panel was repainted while the request was in flight, or
-        // the server sent an unsolicited 304 (we asked unconditionally). Either
-        // way we have no body and nothing trustworthy on screen — go get it.
-        Serial.printf("[IMAGE] unusable 304 (%s), re-fetching unconditionally\n",
-                      conditional ? "panel repainted mid-request" : "not requested conditionally");
-        len = E_INK_WIDTH * E_INK_HEIGHT + 100;
-        buff = httpGetRetry(3, url, NULL, &len, IMAGE_HTTP_REQUEST_TIMEOUT, &respHeaders, &httpCode);
+
+        Serial.printf(
+            "[IMAGE] unusable 304 (%s), re-fetching unconditionally\n",
+            conditional
+                ? "panel repainted mid-request"
+                : "not requested conditionally"
+        );
+
+        downloaded = httpGetToSDRetry(
+            3,
+            url,
+            nextPath,
+            nullptr,
+            IMAGE_HTTP_REQUEST_TIMEOUT,
+            &respHeaders,
+            &httpCode,
+            &downloadedBytes,
+            MAX_SD_IMAGE_SIZE
+        );
     }
 
-    if (!buff)
+    if (!downloaded)
     {
-        Serial.println("[IMAGE] Download failed");
-        // Don't paint the failure banner if a new activity has been queued —
-        // it would briefly show through and (on non-partial-update boards)
-        // clobber message[] via displayCriticalMessage->displayMessage.
-        if (!stopActivity()) {
-            displayCriticalMessage("Image Download Failed");
-        }
+        Serial.println("[IMAGE] SD download failed");
         return false;
     }
-    // check for stop after download before rendering
+
+    Serial.printf(
+        "[IMAGE] SD download complete: %u bytes\n",
+        (unsigned)downloadedBytes
+    );
+
     if (stopActivity())
     {
-        free(buff);
+        spiStart();
+        display.getSdFat().remove(nextPath);
+        spiEnd();
+
         displayStart();
-        display.clearDisplay(); // refresh the display buffer before rendering.
+        display.clearDisplay();
         displayEnd();
+
         return false;
     }
-    Serial.println("[IMAGE] Download done");
 
-    // HTTP X-Dither header wins over MQTT-pending override.
-    int8_t ditherOverride = mqttOverride;
-    auto it = respHeaders.find("X-Dither");
-    if (it != respHeaders.end())
+    // The file is named .png so the Inkplate library selects its PNG SD
+    // decoder. This endpoint must actually return PNG data.
+    bool good = drawImageFromSD(nextPath);
+
+    if (!good)
     {
-        ditherOverride = parseDitherName(it->second.c_str());
+        Serial.println("[IMAGE] Downloaded SD image failed to render");
+
+        spiStart();
+        display.getSdFat().remove(nextPath);
+        spiEnd();
+
+        return false;
     }
 
-    // renderOk, not the return value: drawImageFromBuffer returns true whenever
-    // it painted *something*, including the "Image Display Error" banner it
-    // draws when the decode fails. Caching validators on that would let the
-    // next 304 skip past a stuck error screen.
-    bool renderOk = false;
-    bool good = drawImageFromBuffer(buff, len, false, ditherOverride, &renderOk);
-    free(buff);
-    // drawImageFromBuffer's own displayRefresh() invalidated the cache on its
-    // way through, so this both re-arms it and leaves a failed or aborted
-    // render with no claim on the panel.
-    if (good && renderOk)
+    // Safely promote the successfully rendered file to last-known-good.
+    spiStart();
+
+    SdFat &sd = display.getSdFat();
+    const char *backupPath = "/last.bak";
+
+    sd.remove(backupPath);
+
+    bool hadLast = sd.exists(lastPath);
+    bool promoted = true;
+
+    if (hadLast && !sd.rename(lastPath, backupPath))
     {
-        rememberImageValidators(url, respHeaders);
+        Serial.println("[IMAGE][SD] Could not back up previous cached image");
+        promoted = false;
     }
-    return good;
+
+    if (promoted && !sd.rename(nextPath, lastPath))
+    {
+        Serial.println("[IMAGE][SD] Could not promote new cached image");
+
+        if (hadLast)
+        {
+            if (!sd.rename(backupPath, lastPath))
+            {
+                Serial.println(
+                    "[IMAGE][SD] WARNING: could not restore previous cache"
+                );
+            }
+        }
+
+        promoted = false;
+    }
+
+    if (promoted)
+    {
+        sd.remove(backupPath);
+    }
+
+    spiEnd();
+
+    if (promoted)
+    {
+        Serial.printf(
+            "[IMAGE][SD] Promoted %s to %s\n",
+            nextPath,
+            lastPath
+        );
+    }
+    else
+    {
+        Serial.println(
+            "[IMAGE][SD] Image rendered, but persistent cache promotion failed"
+        );
+    }
+
+    // drawImageFromSD() refreshes the panel and thereby invalidates the
+    // previous validators. Re-arm them for the image now on the glass.
+    rememberImageValidators(url, respHeaders);
+
+    return true;
 }
 
 bool drawImageFromBuffer(uint8_t *buff, size_t size, bool center, int8_t ditherOverride, bool *renderOk) {
@@ -601,4 +782,18 @@ void splashScreen()
     displayEnd();
     i2cEnd();
 #endif
+}
+
+static bool saveCache(const char *path, const uint8_t *data, size_t size)
+{
+    SdFile file;
+    spiStart();
+    bool ok = file.open(path, O_CREAT | O_TRUNC | O_WRONLY);
+    if (ok) {
+        ok = file.write(data, size) == size;
+        file.sync();
+        file.close();
+    }
+    spiEnd();
+    return ok;
 }

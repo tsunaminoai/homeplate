@@ -205,7 +205,14 @@ void runActivities(void *params)
                 Serial.printf("[ACTIVITY][ERROR] HomeAssistant Activity reset while waiting, aborting...\n");
                 continue;
             }
-            drawImageFromURL(plateCfg.imageUrl);
+            // drawImageFromURL(plateCfg.imageUrl);
+            if (WiFi.isConnected()) {
+            if (!drawImageFromURL(plateCfg.imageUrl))
+                drawImageFromSD("/last.png");
+            } else {
+                if (!drawImageFromSD("/last.png"))
+                    drawImageFromSD("/offline.png");
+            }
             break;
         }
         case Trmnl:
